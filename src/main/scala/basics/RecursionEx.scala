@@ -1,13 +1,12 @@
 package basics
 
 import zio.*
-import zio.ZIOAppDefault
 
 import java.io.IOException
 
-object RecursionEx extends ZIOAppDefault {
+object RecursionEx {
 
-  private val readInt: ZIO[Any, Throwable, Int] =
+  val readInt: ZIO[Any, Throwable, Int] =
     for {
       line <- Console.readLine
       int <- ZIO.attempt(line.toInt)
