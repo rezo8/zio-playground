@@ -6,10 +6,10 @@ import java.io.IOException
 
 object RecursionEx {
 
-  val readInt: ZIO[Any, Throwable, Int] =
+  val readInt: ZIO[Any, IOException, Int] =
     for {
       line <- Console.readLine
-      int <- ZIO.attempt(line.toInt)
+      int <- ZIO.attempt(line.toInt).mapError(err => IOException(err))
     } yield int
 
   private val readIntOrRetry: ZIO[Any, IOException, Int] = readInt.orElse(
