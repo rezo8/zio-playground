@@ -17,7 +17,9 @@ lazy val root = (project in file("."))
       "dev.zio" %% "zio-http" % "3.0.1",
       "dev.zio" %% "zio-nio" % "2.0.2",
       "dev.zio" %% "zio-streams" % "2.1.15",
-      "dev.zio" %% "zio-kafka" % "2.10.0",
-      "org.apache.kafka" % "kafka-clients" % "3.9.0"
+      "dev.zio" %% "zio-kafka" % "2.11.0",
+      "org.apache.kafka" % "kafka-clients" % "3.9.0",
+      "dev.zio" %% "zio-test" % zioVersion,
+      "dev.zio" %% "zio-test-sbt" % zioVersion
     )
   )
