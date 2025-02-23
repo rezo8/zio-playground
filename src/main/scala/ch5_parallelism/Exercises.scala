@@ -42,7 +42,7 @@ object StopCountingNow extends ZIOAppDefault {
 }
 
 object CanFailFiber extends ZIOAppDefault {
-  private val canFail: ZIO[Any, Throwable, Unit] =
+  val canFail: ZIO[Any, Throwable, Unit] =
     for {
       _ <- ZIO.sleep(1.seconds)
       x <- {
