@@ -1,0 +1,171 @@
+This chapter describes how to use Ref to model mutable state in a functional way.
+
+9.1: Purely Functional Mutable State
+
+- Refs are all about creating a computation that describes allocating and
+  modifying mutable state rather than modifying the state directly
+    - Thus, we maintain functional paradigms while having programs that mutate state.
+
+- The only way to create a ref is with make, which returns a ZIO effect in context of Ref.
+    - Thus, we need to have an effect that is suspended in an effect constructor.
+    - Always suspend the creation of a mutable state in an effect constructor, i.e. in a ZIO.make
+
+
+9.2: Purely Functional Equivalent of an Atomic Reference.
+
+- Ref allows us to describe mutable state in a functional way that is safe for concurrent access.
+- However, why use Ref? We could just do a ZIO.succeed around non-synchronous effects.
+        i.e. ZIO.succeed(0) instead of Ref.make(0)
+
+- This is because this is unsafe to share the state across multiple fibers like in the following.
+
+        for {
+          variable <- Var.make(0)
+          _ <- ZIO.foreachParDiscard((1 to 10000).toList) { _ =>
+                 variable.update(_ + 1)
+               }
+        result <- variable.get
+        } yield result
+
+    The result of this program is indeterminate due to race conditions.
+    This is the same problem as using a mutable variable instead of an atomic one in
+        side effecting code.
+    The solution is same here, instead of replacing Int with AtomicInteger, we replace A with Ref[A]
+
+    Ref is internally backed by an AtomicReference which is not exposed directly.
+
+    Thus, the safe version of above is.
+    for {
+          ref <- Ref.make(0)
+          _ <- ZIO.foreachParDiscard((1 to 10000).toList) { _ =>
+                 ref.update(_ + 1)
+           }
+          result <- ref.get
+    } yield result
+
+    This will determinately return 100000.
+
+9.3: Operations are Atomic but do not compose atomically.
+
+- One limitation of Ref is that combined operations are not performed atomically.
+
+- The safe version of code above was good because there was only 1 combinator on the Ref.
+- If we add more than 1 combinator, this could be incorrect. For Ex:
+
+    for {
+      ref <- Ref.make(0)
+    _ <- ZIO.foreachParDiscard((1 to 10000).toList) { _ =>
+             ref.get.flatMap(n => ref.set(n + 1))
+           }
+      result <- ref.get
+    } yield result
+
+- This does NOT increment the reference atomically due to the flatmap fetching a value.
+    - This value can be different by the time ref.set is run. This is not an atomic reference.
+- We have to run the change in a modify. It cannot be done by accessing the get directly.
+
+- Best practices to avoid this.
+        - Put all pieces of the state that need to be "consistent" with each other in a single Ref.
+        - Always modify the Ref through a single operation.
+
+
+9.4: Ref.Synchronized for Evaluating Effects while Updating.
+
+- Another limitation of Ref is that we can't perform effects inside Ref modify op as it only supports synchronous ops.
+- The function in modify, MUST be a pure function.
+    - It can't perform effects such as logging or allocating a new mutable state. These will be interrupted.
+
+    - If we NEED to have an efect on each modify, we refactor our code to return a value then perform the
+        effect with the value.
+        For Ex:
+                def updateAndLog[A](ref: Ref[A])(f: A => A): URIO[Any, Unit] =
+                  ref.modify { oldValue =>
+                    val newValue = f(oldValue)
+                ((oldValue, newValue), newValue)
+                }.flatMap { case (oldValue, newValue) =>
+                  Console.printLine(s"updated $oldValue to $newValue").orDie
+                }
+
+- For effects where we need to perform effects within the modify op, we provide a data
+    type called Ref.Synchronized.
+
+    - This performs effects within the modify operation.
+
+    Ref.Synchronized is similar to Ref, and should be used in it's place with it's make function.
+
+    - Each operation on Ref.Synchronized is guaranteed to be performed atomically.
+        - Thus, only 1 fiber can interact with it at a time.
+
+    - One common use case is when we must lalocate mutable state within the update operation.
+        For example, implementing a reference Cache.
+
+        Similar to a cache except that each value is Ref, so multiple fibers may access each one.
+        Ex:
+
+                import zio._
+                trait RefCache[K, V] {
+                  def getOrElseCompute(k: K)(f: K => V): UIO[Ref[V]]
+                }
+                object RefCache {
+                def make[K, V]: UIO[RefCache[K, V]] =
+                  Ref.Synchronized.make(Map.empty[K, Ref[V]]).map { ref =>
+                    new RefCache[K, V] {
+                      def getOrElseCompute(k: K)(f: K => V): UIO[Ref[V]] =
+                        ref.modifyZIO { map =>
+                          map.get(k) match {
+                case Some(ref) =>
+                            ZIO.succeed((ref, map))
+                          case None =>
+                            Ref.make(f(k)).map(ref => (ref, map + (k -> ref))                )
+                        }
+                    }
+                 }
+                }
+            }
+
+            This makes it so that when we access a Ref and it doesn't exist, we add it to the Ref Cache.
+                Thus, fibers will access a Ref through the Ref Cache which will asynchronously add it to a Ref Map.
+
+        However, Ref Synchronized is never as fast as Ref, so Ref is preferable.
+
+        Ref.Synchronized should do as little work as possible within the modify operation.
+
+9.5 Fiber Ref for References specific to each Fiber.
+
+- Sometimes we need to maintain state local to each fiber.
+    This is equivalent of a ThreadLocal in Java.
+        For ex, support logging that is specific to each fiber.
+
+- This is called a FiberRef.
+
+- Look at Tree Log example.
+
+- One operator on FiberRef that is very useful is FiberRef#locally.
+
+- This sets FiberRef to specified value, runs zio effect, then sets value of Fiber Ref back to its original value.
+        - This guarantees the value to be restored after the zio effect completes execution regardless of completion.
+        - The change of the value is ONLY visible to the current locally scoped Fiber. 
+            - Other threads will not see it.
+            
+        This is useful when FiberRef contains config information, i.e. logging level.
+            Thus fiber ref locally could be used to change logging for a specific effect w/o
+            changing logging level for other threads.
+       
+ 
+ 9.6: Conclusion
+ 
+ - Key to remember to always use modify and update operators to make changes as get and set do not compose atomically.
+ 
+ - Always try to use Ref over Ref.Synchronized.
+ 
+ - Make sure you are not using mutable data inside a Ref, and the updates are fast.
+    - There are forced retries on conflicting updates, so if the update take a long time,
+        there is a risk that there will be forced retries due to conflicting updates,
+        leading to poor perf.
+
+ - Use immutable data structures within Refs.
+ 
+ - Next Promises are discussed.
+        While Refs share state, Promises allow for state to be set. Blocking until it occurs.
+        
+     
