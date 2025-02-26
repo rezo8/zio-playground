@@ -1,0 +1,196 @@
+Concurrent Structures: Queue - Work Distribution
+
+
+Queues are buffers between push-based and pull-based interfaces
+
+One example is ZIO Stream.
+
+
+11.1 Queues as Generalizations of Promises.
+
+Like a Promise, a Queue allows fibers to suspend waiting to offer a value to the Queue
+    or to take values from a queue.
+
+Unlike a promise, a queue can contain multiple values,
+ and values can be removed as well as added to the queue.
+
+Promises are good for synching work between fibers while queues are good for distributing work among fibers.
+
+11.2 Offering and Taking Values from a Queue.
+
+import zio._
+trait Queue[A] {
+  def offer(a: A): UIO[Boolean]
+  def take: UIO[A]
+}
+
+offer adds a value and take removes a value form the queue.
+
+
+for {
+  queue <- Queue.unbounded[Int]
+  _     <- ZIO.foreach(List(1, 2, 3))(queue.offer)
+  value <- ZIO.collectAll(ZIO.replicate(3)(queue.take))
+} yield value
+
+
+This adds 1, 2, 3 in that order and prints out 1,2,3 in that order.
+
+Queues are FIFO.
+
+Queues can be unbounded as well as bounded with back pressure, sliding queues, dropping queues, etc...
+
+
+Queue.take will BLOCK until there are values in the Queue to take.
+
+this allows us to create workflows that repeatedly take values without worry they will be blocking.
+
+
+for {
+    queue <- Queue.unbounded[Int]
+    _ <- queue.take
+           .tap(n => Console.printLine(s"Got $n!"))
+           .forever
+           .fork
+    _ <- queue.offer(1)
+    _ <- queue.offer(2)
+} yield ()
+
+THe fork is important here as it means we are no longer blocking, and it will print out 1 and 2 here.
+
+
+11.3 Varieties of Queues
+
+Unlike Ref and Promise, there are several type sof queues.
+
+First decision is if a queue is unbounded or bounded
+
+Most production apps, an unbounded Queue creates risk of memory leak.
+
+Thus, we should use a bounded queue with a capacity, as it cannot grow without limit
+like an unbounded queue.
+
+It raises question of what to do when a caller attempts to offer something to a Queue that is at capacity.
+    ZIO provides 3 strategies for this:
+        Back Pressure
+        Sliding
+        Dropping
+
+11.3.1 Back Pressure Strategy
+
+- If we offer to a queue that is full, the queue offer will block until there is
+    capacity in the queue for that element.
+
+This has an advantage as there is no information lost.
+
+or {
+  queue <- Queue.bounded[String](2)
+  _ <- queue
+         .offer("ping")
+.tap(_ => Console.printLine("ping"))
+         .forever
+         .fork
+} yield ()
+
+This will run .offer forever in a fork.
+
+This fork will only log twice though, until an entry is removed from the queue.
+When the log happens twice, queue.offer will suspend, and wait until the queue has space to complete.
+
+Back Pressure has limitations.
+
+For example, what if we don't want the data to be stale?
+
+
+11.3.2 Sliding Strategy.
+
+This strategy drops the first element in the Queue when it is full and an excess element is offered.
+It removes the first element and adds a new element to the end.
+
+This make sense when we want to avoid staleness, and the newer values in the Queue are more valuable than the oldest values.
+
+
+for {
+queue <- Queue.sliding[Int](2)
+  _     <- ZIO.foreach(List(1, 2, 3))(queue.offer)
+  a     <- queue.take
+  b     <- queue.take
+} yield (a, b)
+
+Queue.take will be 2 and then 3 respectively.
+
+
+11.3.3 Dropping Strategy.
+
+If a queue is at capacity, the value being offered will be dropped and not added to the Queue at all.
+
+This can make sense if we want to maintain a distribution of values.
+
+For example, if we don't care about most recent readings right now.
+
+for {
+  queue <- Queue.dropping[Int](2)
+_     <- ZIO.foreach(List(1, 2, 3))(queue.offer)
+  a     <- queue.take
+  b     <- queue.take
+} yield (a, b)
+
+This will take 1 and 2.
+
+
+11.4 Other Combinators on Queues.
+
+
+11.4.1 Variants of Offer and Take
+
+trait Queue[A] {
+
+    // OfferAll adds all values in the iterable list.
+    // if there is no longer capacity, it suspends until it can offer all values to the queue.
+  def offerAll(as: Iterable[A]): UIO[Boolean]
+
+    // ALlows us to tentatively observe if there is a value in the Queue
+    // takes and returns if there is, returns None otherwise
+  def poll: UIO[Option[A]]
+
+    // Takes all values in the Queue.
+    // This returns immediately with an empty chunk if there are none.
+  def takeAll: UIO[Chunk[A]]
+
+    // Takes immediately like Take All.
+    // returns a list that is at max "max" size
+  def takeUpTo(max: Int): UIO[Chunk[A]]
+
+    // Specifies a minimum and maximum to take.
+        // if number in queue is less than min, it takes all of them then waits until there are min elements.
+        // if number in queue is greater than max, it just takes max and returns.
+  def takeBetween(min: Int, max: Int): UIO[Chunk[A]]
+}
+
+11.4.2 Metrics on Queues
+trait Queue[A] {
+
+    // returns how much room there is left in the queue. for unbounded this is Int.Maxvalue
+    // Not a UIO as it is initialized and stored as a basic int on creation.
+    def capacity: Int
+    // returns number of values in Queue currently.
+    def size: UIO[Int]
+}
+
+11.4.3 Shutting down Queues
+
+trait Queue[A] {
+
+  // returns when queue is shut down.
+  def awaitShutDown: UIO[Unit]
+  // tells you if the queue is shutdown.
+  def isShutdown: UIO[Boolean]
+  // shuts down the queue.
+  def shutdown: UIO[Unit]
+}
+
+
+it is good practice to shut down the queue when you are done with it.
+
+This is discussed in resource handling, which is the next section.
+
