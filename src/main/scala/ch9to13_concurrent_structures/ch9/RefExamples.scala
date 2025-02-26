@@ -37,6 +37,8 @@ object RefExamples extends ZIOAppDefault {
     result <- ref.get
   } yield result
 
+  // TODO complete logger exercise
+
   final case class Tree[+A](head: A, tail: List[Tree[A]])
   type Log = Tree[Chunk[String]]
 
@@ -75,7 +77,6 @@ object RefExamples extends ZIOAppDefault {
       safe <- safeCount
       unsafe <- unsafeCount
       _ <- ZIO.logInfo(s"safe is ${safe}. unsafe is ${unsafe}")
-
       _ <- logTree
     } yield {
       ()

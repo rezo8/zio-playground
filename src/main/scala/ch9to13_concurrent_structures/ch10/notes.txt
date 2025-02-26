@@ -1,0 +1,85 @@
+
+This chapter goes over Promise, the base building block for solving problems in
+concurrent programming.
+
+
+Promises are used to replace Fibers when the Fiber.Join and Await functionality is insufficient.
+(i.e. when we want to wait for a value w/o knowing which fiber is responsible)
+
+import zio._
+trait Promise[E, A] {
+  def await: IO[E, A]
+  def fail(e: E): UIO[Boolean]
+def succeed(a: A): UIO[Boolean]
+}
+
+Promise is a container that has one of 2 states, Empty, or Full where full can be a failure E or success A.
+
+Unlike a Ref, which always has a value, Promises can be empty.
+
+A promise can be completed EXACTLY ONCE. through Promise.succeed and Promise.fail
+
+EX:
+
+for {
+  promise <- Promise.make[Nothing, Unit]
+  left <-
+    (Console.print("Hello, ") *> promise.succeed(())).fork
+  right <- (promise.await *> Console.print(" World!")).fork
+_     <- left.join *> right.join
+} yield ()
+
+
+Here are some other ways of completing promises.
+
+ def die(t: Throwable): UIO[Boolean]
+ def done(e: Exit[E, A]): UIO[Boolean]
+ def failCause(e: Cause[E]): UIO[Boolean]
+ def complete(io: IO[E, A]): UIO[Boolean]
+ def completeWith(io: IO[E, A]): UIO[Boolean]
+
+
+Promises support ZIO’s interruption model.
+ This means that if a Promise is completed with an interrupted effect,
+ all fibers waiting on that Promise will also be immediately interrupted.
+
+
+If you need to share state between different fibers, think about using a Ref.
+
+If you need to synchronize fibers so that something doesn't happen on 1 fiber until
+another proc completes, think about a Promise.
+
+If you need both, use a Promise and a Ref.
+
+Using Promise and Ref to build an asynchronous cache.
+
+
+trait Cache[-K, +E, +V] {
+  def get(key: K): IO[E, V]
+}
+object Cache {
+  def make[K, R, E, V](
+    lookup: K => ZIO[R, E, V]
+  ): URIO[R, Cache[K, E, V]] =
+        for {
+          r   <- ZIO.environment[R]
+          ref <- Ref.make[Map[K, Promise[E, V]]](Map.empty)
+        } yield new Cache[K, E, V] {
+          def get(key: K): IO[E, V] =
+            Promise.make[E, V].flatMap { promise =>
+        ref.modify { map =>
+            map.get(key) match {
+                 case Some(promise) => (Right(promise), map)
+                 case None          => (Left(promise), map + (key -> promise))
+        }
+        }.flatMap {
+          case Left(promise) =>
+            lookup(key)
+              .provideEnvironment(r)
+              .intoPromise(promise) *> promise.await
+          case Right(promise) =>
+                promise.await
+         }
+        }
+    }
+}
