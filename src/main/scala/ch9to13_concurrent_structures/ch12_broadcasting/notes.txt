@@ -1,0 +1,159 @@
+Ch 12: Concurrent Structures: Hub - Broadcasting
+
+A queue does not provide optimal solution for the problem of Broadcasting work.
+
+Difference between queued work and broadcasted work.
+
+- Queue gets A, B, C
+        - First consumer takes A, second takes B, Third takes C.
+        - Each value is done by exactly ONE consumer.
+        - great for when we never want the same unit of work to be done more than once.
+
+- if broadcast gets same work, each value will be consumed by EVERY consumer.
+    - Thus, each unit of work is done by all workers.
+    - This is a fundamental difference.
+
+- To use Queues to broadcast, we need a Queue for each consumer, and duplicate the value on each queue.
+    - This is obviously bad, and a fundamental inefficiency.
+
+12.1 Hub: An Optimal Solution to the Broadcasting Problem.
+
+The hub reimagines this solution as a single data structure, with each consumer maintaining
+their own reference to the position in the data structure they are currently consuming from.
+
+    - Thus, we just need to maintain one data structure and update when a producer produces a new value.
+        as opposed to N data structures updated N times in the naive solution.
+
+    Interface is as follows.
+    sealed abstract class Hub[A] {
+      def publish(a: A): UIO[Boolean] =
+        ???
+      def subscribe: ZIO[Scope, Nothing, Dequeue[A]] =
+        ???
+    }
+    object Hub {
+      def bounded[A](capacity: Int): UIO[Hub[A]] =
+        ???
+    }
+
+
+The publish operator publsihes a value to the hub, similar to the offer operator on Queue.
+
+The Subscribe operator subscribes to receive values from the Hub,
+returning a Dequeue that can be used to take values from the hub.
+
+Scope refers a resource that requires finalization.
+
+When a Scope is closed, the resources within it are interrupted.
+
+Here the resource by the scoped ZIO is the subscription to the Hub.
+Thus when the provided scope is closed, the subscription will be closed too.
+
+The concept of who subscribed to the hub is important as consumers will only
+receive published values to the hub when they are subscribed.
+
+We need to know who is currently subscribed to the hub to know when it is safe to remove them.
+
+Hence the importance of the scope, as it handles subscribing before we take values,
+    and automatically subscribing when we are done.
+
+Here is what a Dequeue looks like:
+
+trait Dequeue[+A] {
+  def take: ZIO[Any, Nothing, A]
+}
+trait Enqueue[-A] {
+    def offer(a: A): ZIO[Any, Nothing, Boolean]
+}
+
+Dequeue is basically a Queue reference that only allows take.
+
+The way to add items to these queues is to add them to the Hub.
+The take operation will wait when there is work to be done from the hub.
+
+Enqueue allows us to offer to a queue only.
+
+Thus dequeue and enqueue data types give us ability to interact with one side of the Hub channel.
+
+This allows us to conceptualize the Hub in two parts, allowing us to use a subscription anywhere else.
+
+
+12.2 Creating Hubs.
+
+Like queues, hubs are bounded or unbounded and can use
+ various strategies to describe what to do if a message is offered
+ while hub is at capacity.
+
+
+12.2.1 Bounded Hubs
+
+Most common variant of a hub. a bounded hub with a backpressure strategy.
+
+Conceptually, a bounded hub is represented by an array containing the values in the hub
+as well as the number of subscribers who still have to take that value.
+
+ Each subscriber  maintains its own index in the array, and each time it takes a value, it decrements the number
+
+ Good guarantees from the back pressure strategy.
+
+ - Guarantees every subscriber will receive every value published to hub while subscribed.
+
+ - Prevents memory leaks due to not being unbounded.
+
+ - Naturally propagates back pressure through the system by causing publishers to suspend until
+    capacity is available.
+
+
+12.2.2 Sliding Hubs
+
+Has a finite capacity. Uses sliding strategy instead of back pressure strategy.
+
+I.e. drops oldest message in the hub, which guarantees publsihing will be completed quickly.
+
+Good for dealing with slow consumer problem.
+
+I.e. 1 of the subscribers is slower than the others, meaning that a lot of old messages only have 1 more unit of work to be done (its work) before dropping the message.
+
+Key is that this strategy removes interdepedentness between subscribers.
+
+12.2.3 Unbounded Hubs
+
+No max capacity. Issue is the memory leak risk.
+Not useful unless we expect a lot of work and for it to be done quickly, and want to guarantee fast publishes.
+
+12.2.4 Dropping Hubs.
+
+Uses the dropping strategy (i.e. not allowing offered messages to be published when queue is at capacity)
+
+
+12.3 Operators on Hubs
+
+sealed trait Hub[A] {
+    def awaitShutdown: UIO[Unit]
+    def capacity: Int
+    def isShutdown: UIO[Boolean]
+    def publish(a: A): UIO[A]
+    def publishAll(as: Iterable[A]): UIO[Boolean]
+    def shutdown: UIO[Unit]
+    def size: UIO[Int]
+    def subscribe: ZIO[Scope, Nothing, Dequeue[A]]
+    def toQueue: Enqueue[A]
+}
+
+Very similar to Queue interface.
+All operators are the same outside of publish and subscribe.
+
+Also important is the toQueue operator, which allows us to view any hub as a Queue that can only be written to.
+    This allows us to use a hub as an input channel, and we can offer to it with the assumption 
+        that whichever subscribers are made on it in the subscriber channel will process our input data.
+        
+12.4 Conclusion
+
+2 main takeaways.
+
+You should be able to recognize jobs that are broadcast associated as opposed to queue associated.
+    if a broadcast work is needed, a Hub solves these problems efficiently.
+    
+secondly, the chapter tried to separate interfaces from underlying representations of Data.
+
+
