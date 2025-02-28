@@ -1,0 +1,94 @@
+Chapter 13: Concurrent Structures: Sempahore - Work Limiting
+
+A Semaphore is used in order to limit work so we don't overwhelm other systems.
+
+13.1 Semaphore Interface
+
+A Semaphore is created w/ a number of permits and defined in terms of a single method. #withPermits
+
+import zio._
+trait Semaphore {
+  def withPermits[R, E, A](n: Long)(
+        task: ZIO[R, E, A]
+    ): ZIO[R, E, A]
+}
+
+Basically, any fiber calling Semaphore must acquire amount of permits.
+
+If number of permits or more are available, number of permits is decremented and fiber can proceed with executing the task.
+
+If permits is unavailable, fiber waits until specified number of permits is available.
+
+All acquired permits will be released and number of available permits is incremented as soon as task finishes.
+
+Semaphore is a parking lot operator, making sure there are only so many cars in the lot at the same time.
+
+Similarly, Sempahore guarantees that if each fiber takes 1 permit, that there is never any more than a speciied number
+of fibers executing a block of code protected by a Semaphore.
+
+This is a straightforward way to limit concurrency without much change to code.
+
+
+13.2 Using Semaphores to Limit Parallelism
+
+
+import zio._
+import zio.Clock._
+import zio.Console._
+
+def queryDatabase(
+  connections: Ref[Int]
+): URIO[Any, Unit] =
+      connections.updateAndGet(_ + 1).flatMap { n =>
+        Console.printLine(s"Aquiring, now $n connections").orDie *>
+            ZIO.sleep(1.second) *> Console.printLine(s"Closing, now ${n - 1} connections").orDie
+    } for {
+        ref       <- Ref.make(0)
+        semaphore <- Semaphore.make(4)
+        query      = semaphore.withPermit(queryDatabase(ref))
+        _         <- ZIO.foreachParDiscard(1 to 10)(_ => query)
+    } yield ()
+
+Without Semaphore above, we would have 10 parallel processes querying database at once.
+
+With Semaphore, 4 queries start and then when one finishes, another begins and so on.
+
+Thus there are never more than 4 simultaneous connections to the DB.
+
+13.3 Using Semaphore to implement Operators.
+
+
+Pattern of using a Semaphore to limit parallelism is so common there is a separate combinator for it.
+this is called foreachParN
+
+
+13.4 Making a Data Structure Safe for Concurrent Access
+
+Another use case with a Semaphore is one with a single permit.
+
+This guarantees only a single fiber can execute a block of code guarded by a Semaphore.
+
+This can be useful when we need to expose a data structure that is unsafe for concurrent access.
+
+We use a Semaphore to run code that accesses this datastructure. A-la
+
+object Ref {
+  object Synchronized {
+    def make[A](a: A): UIO[Ref.Synchronized[A]] =
+      for {
+ref       <- Ref.make(a)
+  semaphore <- Semaphore.make(1)
+} yield new Ref.Synchronized[A] {
+  def modify[R, E, B](
+    f: A => ZIO[R, E, (B, A)]
+  ): ZIO[R, E, B] =
+semaphore.withPermit {
+  for {
+    a <- ref.get
+    v <- f(a)
+    _ <- ref.set(v._2)
+} yield v._1
+} }
+}
+
+This is actually how Ref.Synchronized is implemented in ZIO.
