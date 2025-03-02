@@ -1,0 +1,159 @@
+Chapter 14: Resource Handling
+
+Safe resource handling is critical for any long-running app.
+
+Whenever we a quire a resource, whether a file handle, socket, etc...
+
+We need to ensure that it is released when we are done with it.
+
+If we fail to do this, we will leak resources.
+
+Leaked resources will continue until they deplete all available resources, leading to system failures.
+
+
+However, it is easy to accidentally forget to release a resource or create a situation where
+a resource may not be released every time.
+
+So we need tools that provide strong guarantees that when a resource is acquired,
+    it will always be released to allow us to write code without worrying about leaks.
+
+
+ZIO.acquireRelease and Scope are ZIO's solutions to this.
+
+
+14.1: The Limitation of try-finally in Async programming.
+
+The traditional solution to the problem of safe resource hadnling is the try finally construct.
+
+lazy val example = {
+  val resource = acquire
+  try {
+    use(resource)
+      } finally {
+        release(resource)
+      }
+}
+
+
+If the resource is successfully acquired in the first line,
+    then we immediately begin executing try finally.
+
+    This guarantees that close will be called whether use succeeds or throws.
+
+
+This is good for synchronous code, but it breaks down when we introduce asynchrony.
+
+Lets see what happens when we use Futures instead.
+
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.{Failure, Success}
+trait Resource
+def acquire: Future[Resource]                 = ???
+def use(resource: Resource): Future[Unit]     = ???
+def release(resource: Resource): Future[Unit] = ???
+implicit final class FutureSyntax[+A](future: Future[A]) {
+def ensuring(
+  finalizer: Future[Any]
+)(implicit ec: ExecutionContext): Future[A] =
+  future.transformWith {
+    case Success(a) =>
+      finalizer.flatMap(_ => Future.successful(a))
+    case Failure(e) =>
+        finalizer.flatMap(_ => Future.failed(e))
+        }
+ }
+
+implicit val global = scala.concurrent.ExecutionContext.global
+
+lazy val example =
+    acquire.flatMap { resource =>
+                    use(resource).ensuring(release(resource))
+                  }
+
+The method ensuring means that when a future completes, we run the specified finalizer.
+
+Note that if the finalizer throws an exception, the original exception will be lost.
+
+The problem here however is around interruption.
+
+In general, we need to assume we could get interrupted at any point.
+
+In particular, we could get interrupted between workflows that are composed together.
+
+What happens if we get interrupted after acquire completes but before use begins?
+
+So we would have acquired resource without releasing it (through shutdown hook) creating a leak.
+
+For future this isn't a problem (i.e. after use gets called) because Futures don't support interruption.
+
+They just run until completion, but this is a separate resource problem of its own.
+
+Since we have no way of interrupting a future, we have no way to stop doing work that is no longer needed.
+    For ex, if a user navigates to a web page, queries some information and closes the browser.
+
+
+14.2: Acquire Release as a Generalization of Try and Finally.
+
+The solution to this problem is to use acquireReleaseWith.
+
+acquireReleaseWith operates at all phases of the resource lifecycle together,
+    ensuring that interruptions don't get in the way.
+
+object ZIO {
+   def acquireReleaseWith[R, E, A, B](
+     acquire: ZIO[R, E, A]
+   )(
+ release: A => ZIO[R, Nothing, Any]
+ )(use: A => ZIO[R, E, B]): ZIO[R, E, B] = ???
+
+}
+
+What this code does is that it "acquire's" a resource through a workflow.
+
+and Uses that resource to produce some result.
+
+Release is a function that releases the resource. The type signature indicates release action cannot fail.
+
+The acquireReleaseWith offers the following guarantees:
+
+1. Acquire action will be performed uninterrupted
+2. Release action will be performed uninterrupted
+3. If the acquire action successfully completes, the release action will be performed as soon as the
+    use action completes, regardless of its result.
+
+
+These are the guarantees we need for safe resource handling.
+    The acquire being uninterrupted means that we can't just acquire the resource without releasing it.
+    The release being uninterrupted means that we need to release the resource no matter what and must release it even if there is an interruption
+
+
+Basically, whenever you want to acquire a resource, you should do a acquire release with.
+
+14.3: The Ensuring Operator
+
+ZIO also has an Ensuring operator that handles interruption.
+
+trait ZIO[-R, +E, +A] {
+  def ensuring[R1 <: R](finalizer: ZIO[R1, Nothing, Any]): ZIO[R1, E, A]
+}
+
+
+Ensuring is like acquireReleaseWith but without the resource.
+
+Basically it guarantees that if the original workflow begins execution, the finalizer will always be run as soon as the original effect completes execution.
+
+ensuring is useful in situations where you want to add a finalizer to a workflow.
+
+But make sure you don't use ensuring when acquireReleaseWIth is required.
+
+ensuring only runs if original workflow begins execution.
+If original workflow doesn't begin execution, finalizer won't run.
+
+A good guideline is that if you are working with a resource or
+anything that requires “allocation” in addition to “deallocation,”
+use acquireReleaseWith, otherwise use ensuring.
+
+
+14.4 Conclusion
+
+We learned about acquireReleaseWith and ensuring for resource management.
