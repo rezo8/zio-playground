@@ -1,0 +1,198 @@
+Chapter 15: Resource Handling: Scope - Composable Resources
+
+The ZIO acquireReleaseWith operator is the foundation of safe resource handling in ZIO
+
+However, it is not the most ergonomic.
+
+For example, say we have a class that wants to open 2 files.
+
+
+def withFile[A](name: String)(use: File => Task[A]): Task[A] =
+  ZIO.acquireReleaseWith(openFile(name))(closeFile)(use)
+
+lazy val analyzeWeatherData: Task[Unit] =
+  withFile("temperatures.txt") { weatherData =>
+       withFile("results.txt") { results =>
+            analyze(weatherData, results)
+    }
+ }
+
+Few Issues from this approach:
+This is bad because it is not composable.
+
+We are only working with 2 resources and it already is bad, what if we had a dozen?
+
+There is also an inefficiency.
+
+We open temperatures, then results, and close in reverse order, rather than doing them in separate tasks.
+
+How do we recapture the simplicity we had in using ZIO.acquireReleaseWith
+to deal with single resources in the case where we have multiple resources?
+
+
+15.1. Reification of Acquire Release
+
+def withFile[A](name: String)(use: File => Task[A]): Task[A] =
+  ZIO.acquireReleaseWith(openFile(name))(closeFile)(use)
+
+
+One concern is the acquisition and release of the resource.
+What is required to acquire a particular resource and to release it safely
+ is known by the implementer of the resource.
+
+In this case, the withFile operator itself knows what it means.
+    these concerns are wrapped up in the openFile and closeFile method.
+
+Another concern is how to use the resource.
+    Only the caller of the withFile operator knows what they want to do with the file.
+
+A Scope fixes this issue.
+
+A Scope represents something that finalizers can be added to which will be closed and run all
+finalizers added to it.
+
+
+trait Scope {
+  def addFinalizer[R](
+    finalizer: ZIO[Any, Nothing, Any]
+  ): ZIO[Any, Nothing, Unit]
+  def close(exit: Exit[Any, Any]): ZIO[Any, Nothing, Unit]
+}
+
+When a resource is constructed with acquire release, it adds a finalizer to the scope,
+    hence a scope is necessary for it's creation.
+
+
+lazy val sequential: ZIO[Scope, Throwable, (File, File)] =
+  file("temperatures.txt").zipPar(file("results.txt"))
+def analyzeWeatherData(
+  files: ZIO[Any, Nothing, (File, File)]
+): Task[Unit] =
+  ZIO.scoped {
+    files.flatMap { case (weatherData, results) =>
+      analyze(weatherData, results)
+} }
+
+Is how we fix it, now we combine 2 processes (they happen asynch but block until both returned)
+and return to analyze.
+
+By default, when a Scope is closed, finalizers are run in reverse.
+
+So in above ex, two files still released sequentially based on who finsihes process first.
+
+To make it happen parallel, this is the code:
+
+lazy val parallelRelease: ZIO[Scope, Throwable, (File, File)] =
+  file("temperatures.txt")
+    .zipPar(file("results.txt"))
+    .parallelFinalizers
+
+
+15.2 Scope as a Dynamic Scope
+
+Another way to think about to Scope is as a dynamic vs static scope.
+
+ZIO.acquireReleaseWith(acquire)(release) { resource =>
+  use(resource)
+}
+
+The curly braces above indicate the lifetime of the resource.
+
+Between those open and curly braces, the resource is acquired and not closed.
+Before it is not created, after it is being closed.
+
+This is a fixed scope.
+
+Below is a Dynamic Scope.
+
+val resource = ZIO.acquireRelease(acquire)(release)
+
+We do not know what the life of the resource will be yet, it is just acquired.
+
+1 ZIO.scoped(resource)
+
+^ simply opens it and closes it as nothign is run.
+
+ZIO.scoped {
+  resource.flatMap(doSomething)
+    .flatMap(doSomethingElse)
+    .flatMap(doYetAnotherThing)
+}
+
+Runs process and then closes it.
+
+If you know what you want to do with a resource, i.e open and use contents of file, use acquireReleaseWith.
+
+If you don't know what to do and want to let caller decide, use ZIO.acquireRelease and Scope.
+
+
+15.3 Constructing Scoped Resources
+
+15.3.1 Fundamental Constructors
+
+The most common way of constructing scoped resources is the ZIO.acquireRelease operator we saw above:
+
+Both acquire and release actions are uninterruptible.
+
+15.3.2 Convenience Constructors
+
+We can construct scoped resources with #withFinalizer.
+
+Can be called on any workflow and treats workflow as acquisition of a resource, allowing us to specify finalizer.
+
+trait ZIO[-R, +E, +A] { self =>
+  def withFinalizer[R1](
+    f: A => ZIO[R1, Nothing, Any]
+  ): ZIO[R1 with Scope, Nothing, A] =
+    ZIO.acquireRelease(self)(f)
+}
+
+This,
+
+1 ZIO.acquireRelease(Queue.bounded(4096))(_.shutdown)
+
+is equivalent to Queue.bounded(4096).withFinalizer(_.shutdown)
+
+second is more readable so it is helpful to use it and be aware of it.
+
+There are also implementations that use AutoClosable trait,
+    so that we can just use a resource that implements it
+    close will be subsequently automatically run at end.
+
+
+15.4 Transforming Scoped Resources.
+
+We can run parallel Finalizers on a scope so that they run in parallel.
+
+Note, running finalizers in reverse order makes sense because a resource may depend on if a
+previously acquired resource is still valid, thus we should be careful with it.
+
+#withEarlyRelease is another handy method, allowing us to close resources within a particular workflow
+    before the scope is closed.
+        Useful for a small task (i.e. loading from file) within a larger resource intensive scope.
+
+15.5 Using Scoped Resources
+
+Final step in working with scope is to eliminate it.
+
+One way to do this is with ZIO.scoped.
+
+This creates a scope before running a workflow, then closes Scope when the workflow completes
+
+It is quite flexible, and very useful. However it can be abused.
+
+ZIO.scoped {
+  file("temperatures.txt") // don't do this!
+}
+
+
+ZIO.scoped {
+  for {
+weatherData <- file("temperatures.txt")
+    results     <- file("results.txt")
+    _           <- analyze(weatherData, results)
+} yield () } // Do this instead, as analyze finishing leads to the closing of the files (which have acquireReleaseWith in them)
+
+
+In production code it is good to use scoped ourselves so we don't keep resources open for whole app life.
+
