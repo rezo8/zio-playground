@@ -1,0 +1,156 @@
+Chapter 16: Resource Handling: Advanced Scopes
+
+
+Looking at Scope and how it can be used to describe resources.
+
+This gives us foundation to understand more advanced operators in ZIO for working with Resources.
+
+16.1 Scopes Revisited.
+
+Add Finalizer is changed to a function, Exit[Any, Any] => UIO[Any]
+
+Thus, the finalizer can possibly look at exit that Scope is closed with to determine what finalizaiton is required.
+
+Also added the Closable interface, whcih separates the ability to add finalizer to scope from closing scope.
+
+The Closable interface allows us to add a finalizer and Close it.
+
+    But if we only have a Scope, we can add finalizers but can't close it.
+
+This distinction is helpful as it allows us to pass a reference to a scope to someone
+    with limited access rights where they can add finalizers but not close it.
+        this avoids premature closing.
+
+For example:
+
+def scopeWith[R, E, A](f: Scope => ZIO[R, E, A]): ZIO[R, E, A] =
+  ???
+
+This allows us to access current Scope and do something with it (i.e. add finalizer)
+
+scopeWith { scope =>
+  scope.addFinalizer(ZIO.debug("Finalizing!"))
+}
+
+However! It is not allowed to close the scope.
+
+
+16.2 From Scopes to Resources
+
+
+Now that we have a Scope, how do we go from it to describing resources?
+
+ZIO.acquireRelease allows us to construct a resource with a Scope, but what if we need to access that scope?
+
+This is done through the ZIO.scope operator.
+
+def scope: ZIO[Scope, Nothing, Scope] =
+  ZIO.service[Scope]
+
+This services a Scope, allowing us to acquire the release on it.
+
+def acquireRelease[R, E, A](
+  acquire: ZIO[R, E, A]
+)
+
+allows us to acquire the resources present in R, for example a database.
+
+16.3 Using Resources
+
+Scope maintains internal state that represents finalizers and allows us to provide
+    further resources alongside it.
+
+
+trait Scope { self =>
+def extend[R, E, A](
+  zio: ZIO[R with Scope, E, A]
+): ZIO[R, E, A] =
+  zio.provideSomeEnvironment[R] { environment =>
+    environment.union[Scope](ZEnvironment(self))
+  }
+}
+
+Thus we can add necessary resources to a scope in type R, and access across procs with
+    a ZIO.service, provided that the resource is properly provided/available.
+
+
+16.4 Child Scopes
+
+Child Scopes are another concept we use when implementing operators to work with resources.
+
+Not so important so skipped whoops.
+
+16.5 Putting it All Together
+
+For most use cases, ZIO.acquireRelease alongside scoped give us all we need.
+
+Both of these ops have advantage of keeping acquisition and release of resources
+closely tied together, allowing us to write code with powerful guarantees about resource safety.
+
+However, for some advanced use cases, we may need to separate acquisition and release of
+resources more.
+
+This works on implementing memoized operator that returns a memoized version of a func
+that acquires a resource.
+
+def memoize[R, E, A, B](
+  f: A => ZIO[R, E, B]
+): ZIO[Scope, Nothing, A => ZIO[R with Scope, E, B]] =
+  ???
+
+
+If the function has not been called with given input, it should
+    - call f to acquire resource
+    - store it
+    - return it
+
+If it has been called, it should:
+    - return previously acquired resource
+
+Since we are going to acquire resource once and use multiple times, we don't want to
+release when we are done using it, but instead when the oter Scope is closed.
+
+To run this, we need a Scope to add finalizers, and a Map to keep track of resources
+we have previously acquired.
+
+
+def memoize[R, E, A, B](
+f: A => ZIO[R, E, B]
+): ZIO[Scope, Nothing, A => ZIO[R with Scope, E, B]] =
+    for {
+        scope <- ZIO.scope
+        ref   <- Ref.make(Map.empty[A, Promise[E, B]])
+    } yield ???
+
+
+just a Scope is required as memoize returns resource itself, and thus can be composed with other resoruces.
+
+Now to complete it, the resource is made and returned if it doesn't exist in the Map.
+
+def memoize[R, E, A, B](
+  f: A => ZIO[R, E, B]
+): ZIO[Scope, Nothing, A => ZIO[R with Scope, E, B]] =
+  for {
+    scope <- ZIO.scope
+    ref   <- Ref.make(Map.empty[A, Promise[E, B]])
+    } yield a =>
+      Promise.make[E, B].flatMap { promise =>
+        ref.modify { map =>
+          map.get(a) match {
+            case Some(promise) =>
+    (promise.await, map)
+    case None =>
+      (
+        scope.extend[R](f(a)).intoPromise(promise) *>
+          promise.await,
+        map + (a -> promise)
+    ) }
+    }.flatten }
+
+
+The extend operator is important here, as it extends scope of each acquired resource into
+the scope of memoize
+
+Thus, all acquired resources will be released when Scope is closed, but not before that.
+
+This is very key for production code.

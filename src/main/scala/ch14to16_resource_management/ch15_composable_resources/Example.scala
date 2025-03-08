@@ -56,7 +56,7 @@ object Example extends ZIOAppDefault {
         inMemMapRef <- Ref.make(Map[K, (V, Long)]())
 
       } yield
-      // TODO this does not handle collisions. To fix we should put expiry date on key.
+
       new Cache[K, V] {
         override def put(key: K, value: V, ttl: Duration): UIO[Unit] = {
           val expiration = Instant
