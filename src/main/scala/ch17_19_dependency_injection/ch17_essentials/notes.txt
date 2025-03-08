@@ -1,0 +1,446 @@
+Chapter 17: Dependency Injection: Essentials
+
+
+17.1 The Environment Type
+
+A simple mental of ZIO model is as follows
+
+type ZIO[-R, +E, +A] = ZEnvironment[R] => Either[Cause[E], A]
+
+ZEnvironment is a map of types of services to implementations of those services.
+
+For EX a ZEnvironment[Int & String] might look like this:
+
+ZEnvironment(
+    Int -> 42,
+    String -> "Hello World"
+)
+
+A ZIO[R, E, A] requires a set of services R to be run.
+
+R is the context that R requires to be run.
+
+For example, we saw ZIO[R with Scope, E, A].
+
+This resource required a scope to add the finalizers associated with the resource to.
+
+We also have workflows that may be executed in the context of some Request that provides
+information on the current HTTP request we are handling.
+
+for example
+
+import zio._
+trait Request
+lazy val workflow: ZIO[Request & Scope, Throwable, Unit] =
+  ???
+
+
+The workflow needs a Request and a Scope to be run.
+
+When we combine workflows, their environments get combined to the subsequent ZIO.
+
+
+lazy val workflow1: ZIO[Request, Throwable, Unit] = ???
+lazy val workflow2: ZIO[Scope, Throwable, Unit]   = ???
+lazy val workflow3: ZIO[Request & Scope, Throwable, Unit] = workflow1 *> workflow2
+
+Any represents a workflow that does not require any services to be run.
+
+Importantly, & is associative and commutative, so the order of types in the env type doesn't matter.
+
+Also, it doesn't matter how often a service appears in the environment type.
+
+I.e. ZIO[Scope & Scope & Scope, Throwable, Unit] == ZIO[Scope, Throwable, Unit]
+
+17.2 Fundamental Operators for Working with the Environment.
+
+ZIO.environment operator
+
+allows us to access a set of services in the environment and introduces a DEPENDENCY on those services
+
+ZIO.service constructor
+
+Accesses a service within the environment rather than a bundle of services.
+
+Once we access a service or set of services from the environment, we can do anything we
+want with them using other operators on ZIO such as ZIO#map and ZIO#flatMap:
+
+
+ZIO.service[Scope].flatMap(scope => scope.addFinalizer(???))
+
+Equiv to
+
+ZIO.serviceWithZIO[Scope](scope => scope.addFinalizer(???))
+
+
+The ZIO environment type ultimately lets us "borrow" a service we don't have yet.
+As long as a service is provided, we can run the program.
+
+Thus, the ZIO.provideEnvironment operator is used.
+
+lazy val needsAnInt: ZIO[Int, Nothing, Unit] =
+  ZIO.serviceWithZIO[Int](ZIO.debug(_))
+lazy val readyToRun: ZIO[Any, Nothing, Unit] =
+  needsAnInt.provideEnvironment(ZEnvironment(1))
+
+
+
+17.3 Typical Uses for the Environment
+
+When and how is an environment used?
+
+An environment represents some context or capability that can be locally eliminated.
+
+I.e. it is a representation of a worfklows requirement for some context.
+For example, a Trasnaction that represents a database transaction. It can ultimately be used as
+a fancy way of input in case it is nontrivial to get them.
+
+Another usecase, the more obvious one perhaps, is to represent some service that our workflow depends on.
+
+This leans into the Onion Architecture, which ZIO highly encourages.
+
+
+17.4 The Onion Architecture
+
+Lets build out an example where we build an app that calls the GitHub API using HTTP libraries.
+
+
+Rather than building out everything in the main as below...
+object Main extends ZIOAppDefault {
+  val run =
+    ??? // All my program logic here
+}
+
+We should organize our layers of logic.
+
+
+Business Logic
+    - What we want to do independent of how we get it.
+    - I.e. get all open issues, present to the user, get user input, add comment.
+
+Github API Logic
+    - describes how these business concepts should be translated into the domain of the Github API.
+    - It describes URL we should call but doesn't know anything about what to do with the URL.
+
+HTTP Logic
+    - this knows how to make a request to the URL and return a response.
+    - it is implemented in terms of a library, like zio-http.
+
+By mixing all these layers in the run method, we have made it harder to reason about any of them.
+
+If we modify one logic, we would maybe have to modify the other logic, making it more difficult to
+refactor code and increases the risk of introducing bugs.
+
+This also makes our code less testable as we have no way of subbing in a test version of one of these layers
+    - this would be useful in order to see how we respond to certain responses from the HTTP service.
+
+The onion architecture allows us to avoid this.
+
+The fundamental idea is to represent each layer as their own service.
+
+Business logic is at center of the onion, and each other layer
+translates that logic into something closer to the outside world.
+
+trait Issue
+final case class Comment(text: String) extends Issue
+trait BusinessLogic {
+  def run: ZIO[Any, Throwable, Unit]
+}
+trait GitHub {
+  def getIssues(organization: String): ZIO[Any, Throwable, Chunk[Issue]]
+  def postComment(issue: Issue,comment: Comment): ZIO[Any, Throwable, Unit]
+}
+
+trait Http {
+  def get(url: String): ZIO[Any, Throwable, Chunk[Byte]]
+  def post(url: String,body: Chunk[Byte]): ZIO[Any, Throwable, Chunk[Byte]]
+}
+
+Each Layer is implemented almost exclusively in terms of the next outer layer.
+
+For instance, buisness logic is implemented exclusively in terms of the Github service.
+
+
+Here is what a simple implementation would look like.
+
+final case class BusinessLogicLive(github: GitHub)
+    extends BusinessLogic {
+  val run: ZIO[Any, Throwable, Unit] =
+    for {
+    issues <- github.getIssues("zio")
+      comment = Comment("I am working on this!")
+      _ <- ZIO.getOrFail(issues.headOption).flatMap { issue =>
+             github.postComment(issue, comment)
+           }
+    } yield ()
+}
+
+
+final case class GitHubLive(http: Http) extends GitHub {
+  def getIssues(  organization: String): ZIO[Any, Throwable, Chunk[Issue]] = ???
+  def postComment(issue: Issue, comment: Comment): ZIO[Any, Throwable, Unit] = ???
+}
+
+final case class HttpLive() extends Http {
+  def get(url: String): ZIO[Any, Throwable, Chunk[Byte]] = ???
+  def post(url: String, body: Chunk[Byte]): ZIO[Any, Throwable, Chunk[Byte]] = ???
+}
+
+Now that we have all these services, we combine as follows:
+
+object Main extends ZIOAppDefault {
+  val http: Http                   = HttpLive()
+  val github: GitHub               = GitHubLive(http)
+  val businessLogic: BusinessLogic = BusinessLogicLive(github)
+
+  val run =  businessLogic.run
+}
+
+So we basically create each of our services and work our way into the business logic at the end.
+
+The dependencies are passed through constructors
+
+However there is still an issue here.
+
+Due to all the constructors and "wiring" the code can become a mess of highly nested
+spaghetti code that is hard to reason about.
+
+This is a typical problem in big applications that ZIO fixes with Layers.
+
+17.5 Layers
+
+A ZLayer is a recipe for building some service.
+
+trait ZLayer[RIn, E, ROut]
+
+Given RIn, we create ROut with potential to fail with error E.
+
+For example, ZLayer[Http, Nothing, GitHub] takes in HTTP and returns a Github service.
+
+
+17.5.1 Constructing Layers
+
+The simplest way to create it.
+
+Used when the service requires no initialization and finalization.
+
+
+object BusinessLogicLive {
+  val layer: ZLayer[GitHub, Nothing, BusinessLogic] =
+ZLayer.fromFunction(BusinessLogicLive(_))
+}
+object GitHubLive {
+  val layer: ZLayer[Http, Nothing, GitHub] =
+    ZLayer.fromFunction(GitHubLive(_))
+}
+
+Lets say that there needs to be a start or more logic in a creation of a layer.
+
+We do this:
+
+object HttpLive {
+  val layer: ZLayer[Any, Throwable, Http] =
+    ZLayer {
+        for {
+            http <- ZIO.succeed(HttpLive())
+            _    <- http.start
+          } yield http
+    }
+}
+
+This ensures every time we build the Http service, we start it before doing anything else with it.
+
+If the service requires finalization, we can add them too!
+
+
+object HttpLive {
+  val layer: ZLayer[Any, Throwable, Http] =
+    ZLayer.scoped {
+        for {
+            http <- ZIO.succeed(HttpLive())
+            _    <- http.start
+           _     <- ZIO.addFinalizer(http.shutdown)
+          } yield http
+    }
+}
+
+
+If a service requires other services (i.e. HTTPConfig) we can use that as well through accessing services.
+
+
+object HttpLive {
+  val layer: ZLayer[HttpConfig, Throwable, Http] =
+    ZLayer.scoped {
+        for {
+            config <- ZIO.service[HttpConfig]
+            http <- ZIO.succeed(HttpLive(config))
+            _    <- http.start
+           _     <- ZIO.addFinalizer(http.shutdown)
+          } yield http
+    }
+}
+
+
+17.5.2 Providing Layers
+
+Now that we can construct layers, how do we wire them up?
+
+object Main extends ZIOAppDefault {
+   val run =
+ ZIO.serviceWithZIO[BusinessLogic](_.run)
+ }
+
+ This will now fail seeing we need to provide implementation of Business Logic to continue.
+
+ we do that with the provide which lets us give a layer to a ZIO workflow that needs the services constructed by that layer.
+
+
+ object Main extends ZIOAppDefault {
+    val run = ZIO.serviceWithZIO[BusinessLogic](_.run)
+       .provide(BusinessLogicLive.layer)
+ }
+
+ This still fails though, as it needs a GitHub service, which is required by BusinessLogic service.
+
+
+ object Main extends ZIOAppDefault {
+     val run = ZIO.serviceWithZIO[BusinessLogic](_.run)
+        .provide(BusinessLogicLive.layer, GithubLive.layer)
+  }
+
+ Now it still fails, since it needs an Http Service
+
+
+object Main extends ZIOAppDefault {
+     val run = ZIO.serviceWithZIO[BusinessLogic](_.run)
+        .provide(BusinessLogicLive.layer, GithubLive.layer, HttpLive.layer)
+  }
+
+and voila, it now runs.
+
+
+If we want to compose layers independently of providing them to the application, we can also do that.
+
+For EX, we may want to combine the Github.live layer and the Http.live layer to
+create a new layer that constructs the GitHub service and has no further deps.
+
+We do this with a ZLayer.make operator
+
+
+val githubLayer: ZLayer[Any, Throwable, GitHub] =
+  ZLayer.make[GitHub](
+    GitHubLive.layer,
+    HttpLive.layer
+)
+
+This is very useful when we have a large number of services, as we can build reasonably
+sized groups of services and compose them together.
+
+Now lets see we want to have a layer that could take a test implementation of Http.
+
+
+val testable: ZIO[Http, Throwable, Unit] =
+ZIO
+  .serviceWithZIO[BusinessLogic](_.run)
+  .provideSome[Http](
+    BusinessLogicLive.layer,
+    GitHubLive.layer
+  )
+
+Basically we add it as an RIn (through the provideSome[Http]) to later provide in a test scenario.
+
+
+17.6 Accessors
+
+When we need to call an API from a service, we first need to obtain access to that service
+
+Once there is access, we can call any method on the service.
+
+
+val app: ZIO[BusinessLogic, Throwable, Unit] =
+  for {
+    business <- ZIO.service[BusinessLogic]
+    _        <- business.run
+    } yield ()
+
+We can also do the following to achieve same result in single step.
+
+
+val app: ZIO[GitHub, Throwable, Unit] =
+  ZIO.serviceWithZIO[BusinessLogic](_.run)
+
+
+This grabs the BusinessLogic from ZIO environment.
+
+serviceWith ops are utilized to access specific functionalities of the given service
+from the environment
+
+To make code more concise we can define accesor methods in companion object of service trait.
+
+i.e.
+
+object BusinessLogic {
+  def run: ZIO[BusinessLogic, Throwable, Unit] =
+    ZIO.serviceWithZIO(_.run)
+}
+
+Now main can be the following whereas
+ before we were needing to call ZIO.serviceWithZIO[BusinessLogic] in the main
+
+
+object Main extends ZIOAppDefault {
+  val run = BusinessLogic.run.provide(
+    BusinessLogicLive.layer,
+    GitHubLive.layer,
+    HttpLive.layer
+   )
+}
+
+This pattern is more common and an effective way to make code more concise and readable.
+
+We can do the same thing for all the services in the application.
+
+object GitHub {
+  def getIssues(organization: String): ZIO[GitHub, Throwable,Chunk[Issue]] =
+    ZIO.serviceWithZIO(_.getIssues(organization))
+
+
+  def postComment(issue: Issue, comment: Comment): ZIO[GitHub,Throwable, Unit] =
+    ZIO.serviceWithZIO(_.postComment(issue, comment))
+}
+
+
+17.7 Service Pattern
+
+The pattern introduced in this chapter is the Service Pattern
+
+This comprises 5 steps.
+
+1. Define a service trait/interface that describes the functionality of the service.
+2. Implement the service in a concrete case class.
+3. Introduce service dependencies via the class constructor
+4. Write a service layer, and define its initializer and finalizer logic.
+5. Write accesors for the service to make the DSL more ergonomic.
+
+This closely resembles object-oriented programming, but decouples services implementation
+from its usage, making the code easier to test and maintain.
+
+Lets summarize the steps we followed.
+
+1. Defined the BusinessLogic Github and HTTP services as traits along with corresponding data types.
+2. Implemented services in concrete classes, i.e. BusinessLogicLive
+3. Introduced service dependencies via the constructor
+4. Created service layers within companion objects i.e. GitHubLive.layer
+5. Implemented accessors for the services to streamline the DSL, including methods like GitHub.getIssues
+
+By following these steps, the service pattern provides a structured approach to robust and maintainable services like what we get in OOP.
+
+The pattern ensures that program logic is separated from implementation details, allowing code to remain independent of class implementations.
+
+Consequently, testing and maintainence is easier.
+
+17.8 Declaring Dependencies via ZIO Environment or Constructor Arguments?
+
+Basically, we should accept all dependencies inside constructor of the implementation,
+and expose the constructor via layers that require certain environments or are in charge of
+construction.
