@@ -1,0 +1,488 @@
+Ch 20: Configuration Management
+
+Configuration management is very important for cloud-native apps.
+
+As applications grow in complexity, the need for flexible and type-safe configuration is increasingly important
+
+This chapter talks about config management in ZIO applications, with a focus on leveraging ZIO's native capabilities.
+
+
+20.1 Configuration Challenges
+
+Instead of hardcoding values, we need flexible ways to manage various settings
+that may change across environments or deployments.
+
+These configs can range from basic infra details like server hosts and ports
+to sensitive credentials like DB connection strings and API keys to runtime behavior.
+
+While it seems simple, robust config systems present several challenges.
+
+- Type Safety
+- Compsoability to combine multiple configurations sources
+- handle missing/invalid values appropriately.
+- KISS problem.
+
+20.2 Configuration Methods in Practice
+
+Understanding alternative approaches before adopting ZIO's native approach.
+
+Here is an example of managing configs thru passing them as function arguments.
+
+import zio._
+object DocumentService {
+  def make: ZIO[Any, Throwable, DocumentService] =
+    for {
+      databaseConfig <- DatabaseConfig.load()
+      database       <- Database.make(databaseConfig)
+      loggingConfig <- LoggingConfig.load()
+      logging       <- ZIO.service[Logging]
+      storageConfig <- StorageConfig.load()
+      storage       <- Storage.make(storageConfig)
+      config <- DocumentServiceConfig.load()
+    } yield new DocumentService(config, logging, database, storage)
+}
+object MainApp extends ZIOAppDefault {
+  def run =
+    DocumentService.make
+      .flatMap(_.start)
+}
+
+However passing config as function args has serious limitations.
+
+as applications scale, manually threading configs through multiple layers is tedious and error prone.
+
+Each new service or component adds more configuration, leading to increasingly complex function signatures and dep chains.
+
+Second, this approach enforces a rigid 2-phase initialization pattern.
+    1) Load all configs
+    2) Construct services with those configs.
+
+This makes service implementations less flexible and creates repetitive boilerplate code.
+
+Using ZIO's environment to propagate configuration instead is more elegant.
+
+Here's what it looks like:
+
+import zio._
+
+object DocumentService {
+  val live: ZLayer[DocumentServiceConfig with Logging with Database with Storage,
+  Throwable,
+  DocumentService
+] =
+   ZLayer.fromZIO {
+       for {
+         logging <- ZIO.service[Logging]
+         database <- ZIO.service[Database]
+         storage <- ZIO.service[Storage]
+   config <- ZIO.service[DocumentServiceConfig]
+         } yield new DocumentService(config, logging, database, storage) }
+   }
+   DocumentService.make
+     .flatMap(_.start)
+     .provide(
+       Logging.live,
+       LoggingConfig.live,
+       Database.live,
+       DatabaseConfig.live,
+       Storage.live,
+       StorageConfig.live,
+       DocumentService.live,
+       DocumentServiceConfig.live
+   )
+
+
+We basically just skip steps by injecting dependencies directly.
+
+However there are some draw backs.
+
+1) Overuse of ZIO Environment.
+    While powerful, this can lead to bloated mix of service and config combinations within env.
+        reduces code readability and maintainability as apps get bigger.
+
+2) Lack of standardized configuration management.
+    ZIOs flexible nature allows us to implement the config management in various ways.
+    while useful, it can lead to divergent implementation patterns across teams and projects
+    This can lead to slow adoptability of patterns.
+
+    The lack of standarized config practices can hinder project maintainability.
+
+3) Limited Multi-Source Configuration Support
+
+    Integrating multiple configurations requires significant manual implementation effort.
+        Lack of built-in abstractions for handling diverse config sources (such as envioronment variables)
+        means developers must write and maintain considerable boilerplate code.
+
+    This can be challenging when dealing with complex config hierarchies.
+
+To address this, ZIO introduces ZIO Config
+
+2 Basic concepts
+
+1) Config Descriptor
+2) Config Provider
+
+Given two inputs, you load config of type A with following loadConfig function:
+
+import zio._
+
+def loadConfig[A](
+    configDescriptor: Config[A],
+    configProvider: ConfigProvider
+): ZIO[Any, Config.Error, A] =
+  ZIO.withConfigProvider(configProvider) {
+    ZIO.config[A](configDescriptor)
+}
+
+Config[A] is a descriptor that describes structure of the configuration of type A.
+
+Config Provider is the way we load the configuration from a specific source.
+    such as environment vaiables, system properties, files, or external services.
+
+    ZIO Config has built-in providers for common configuration sources, with ability to create custom providers.
+
+Here is a simple config.
+
+# application.conf
+host = "localhost"
+port = 8080
+
+
+import zio._
+case class AppConfig(host: String, port: Int)
+
+object AppConfig {
+    implicit val config: Config[AppConfig] = {
+      Config.string("host") zip // Read a string value from the "
+    host" key configuration
+        Config.int("port")      // Read an integer value from the "
+      port" key configuration
+    }.map {
+      case (host, port) => AppConfig(host, port)
+    }
+}
+
+
+This companion object defines a config descriptor using config DSL.
+Gets 2 files and zips them together to map them to an App Config.
+
+Now to load this config using typesafe HOCON file.
+
+ZIO Core has built-in config providers for common config sources such as env variables, system properties
+and console inputs.
+
+import zio._
+import zio.config.typesafe.TypesafeConfigProvider._
+
+val config: ZIO[Any, Config.Error, AppConfig] =
+      loadConfig[AppConfig](
+        AppConfig.config,
+        fromHoconFilePath("config.conf")
+    )
+
+Now we are ready to run the application with the loaded configuration:
+
+object MainApp extends ZIOAppDefault {
+  def run =
+    config.flatMap { config =>
+      ZIO.debug(s"Server started with ${config.host}:${config.port}")
+      }
+    }
+
+However, we can reduce some boilerplate
+
+1st: We can derive the config.
+
+libraryDependencies += "dev.zio" %% "zio-config-magnolia" % "
+    4.0.2"
+
+
+import zio.config.magnolia._
+case class AppConfig(host: String, port: Int)
+
+
+object AppConfig {
+  implicit val config: Config[AppConfig] = deriveConfig[AppConfig]
+}
+
+2) we can implicitly load the config with the implicit reader.
+
+3) We can update default configuration provider for the entire application rather than passing config around.
+
+ZIO uses ConfigPRovider.defaultProvider for loading configurations and storing them in a FiberRef.
+
+So we can just update default provider by using setConfigProvider to bootstrap layer.
+
+Here is what it looks like:
+
+
+import zio._
+import zio.config.magnolia._
+
+import zio.config.typesafe.TypesafeConfigProvider._
+case class AppConfig(host: String, port: Int)
+object AppConfig {
+  // Automatically derive the configuration descriptor for
+    AppConfig
+  implicit val config: Config[AppConfig] = deriveConfig[AppConfig]
+}
+
+object MainApp extends ZIOAppDefault {
+  // Update the default configuration provider globally
+  override val bootstrap =
+    Runtime.setConfigProvider(fromHoconFilePath("config.conf"))
+    def run = for {
+        // Load the configuration using the ZIO.config operator
+        config <- ZIO.config[AppConfig]
+        _      <- ZIO.debug(s"Server started with ${config.host}:${config.port}")
+    } yield ()
+}
+
+20.3 Describing Configuration
+
+For primitive types, there are basic values such as Config.string, Config.int.
+
+
+Config.string("host").nested("Server "):
+
+Server {
+  host = "localhost"
+}
+
+
+Config.string("host").nested("Server").nested ("Application"):
+
+Application {
+    Server {
+        host = "localhost"
+    }
+}
+
+.optional can determine config as optional.
+
+boolean("cors_origins").optional:
+
+host = "localhost"
+ ; cors_origins = true
+
+
+for multiple values/lists we use Config.chunkOf, Config.listOf, Config.vectorOf, Config.setOf.
+
+
+Config.listOf("blocked_hosts", Config.string):
+
+blocked_hosts = ["example.com", "example.org", "example.net"]
+
+
+Can provide defaults for configs.
+
+Config.int("port").withDefault(8080)
+
+Can also provide validations for config.
+
+Config.int("port").validate("should be between 1 and 65535")(p =>
+     p >= 1 && p <= 65535)
+
+
+Loading config can fail with a ConfigError.
+
+For example, if we wanted to parse a uuid direct:
+
+import java.util.UUID
+ import scala.util.control.NonFatal
+ def uuid: Config[UUID] =
+   Config.string.mapOrFail(text =>
+     try Right(UUID.fromString(text))
+ catch {
+     case NonFatal(_) =>
+       Left(Config.Error.InvalidData(Chunk.empty, s"Expected a
+   uuid, but found ${text}"))
+   }
+ )
+
+
+Now lets look at complex configurations.
+
+Here is an example case class with configuration descriptor using zip and map operators.
+
+case class MysqlConfig(
+   host: String,
+   port: Int,
+   username: String,
+   password: Secret
+ )
+
+object MysqlConfig {
+    implicit val config: Config[MysqlConfig] = {
+        Config.string("host") zip
+            Config.int("port") zip
+            Config.string("username") zip
+            Config.secret("password")
+    }.map {
+        case (host, port, username, password) =>
+            MysqlConfig(host, port, username, password)
+    }
+}
+
+None on Secret type.
+    Ensures memory safe operations and prevents passwords from being exposed in logs unintentionally.
+
+        It NEVER allows the password to be seen and even encrypts its comparison algorithm to be constant time so no
+            info is garnered from the duration of the call (i.e. due to lenght of pw)
+
+
+Here is a scenario where a user has two choices, use either MySQL Config or SQllite Config.
+
+
+import zio._
+import zio.Config.Secret
+sealed trait DatabaseConfig
+
+case class MysqlConfig(
+  host: String,
+port: Int,
+  username: String,
+  password: Secret
+) extends DatabaseConfig
+
+case class SqliteConfig(path: String)
+  extends DatabaseConfig
+
+
+object MysqlConfig {
+  implicit val config: Config[MysqlConfig] =
+    {
+      Config.string("host") zip
+        Config.int("port") zip
+        Config.string("username") zip
+        Config.secret("password")
+    }.map { case (host, port, username, password) =>
+        MysqlConfig(host, port, username, password)
+    }.nested("Mysql")
+}
+
+
+object SqliteConfig {
+  implicit val config: Config[SqliteConfig] =
+Config.string("path").map(SqliteConfig(_)).nested("Sqlite")
+}
+
+object DatabaseConfig {
+  implicit val config: Config[DatabaseConfig] =
+    MysqlConfig.config orElse SqliteConfig.config // Load mySQL or look for SQLite after
+}
+
+
+20.4 Config Providers
+
+Config providers are responsible for loading configurations from various sources such as
+env variables, system properties, files and external services.
+
+You can think of them as the following trait.
+
+trait ConfigProvider {
+    def load[A](config: Config[A]): IO[Config.Error, A]
+}
+
+This takes a config discriptor of type A, and returns an effect with a config value of type A.
+    if there as an error in parsing/loading, it fails with config.Error.
+
+Has a fallback operator called orElse that allows you to chain multiple configs together.
+
+
+lazy val defaultProvider: ConfigProvider =
+        ConfigProvider.envProvider.orElse(
+          ConfigProvider.propsProvider
+        )
+
+Designed to work with various complex configs such as Typesafe HOCON, YAML, JSON and XML.
+
+Here are some of them:
+
+
+• ConfigProvider.envProvider: Loads configurations from environment vari- ables.
+• ConfigProvider.consoleProvider: Loads configurations from console input.
+• ConfigProvider.propsProvider: Loads configurations from system properties.
+• ConfigProvider.fromAppArgs: Loads configurations from command-line arguments.
+• ConfigProvider.fromMap: Loads configurations froma map of key-value pairs.
+It is useful for integration with external configuration libraries or for testing purposes.
+
+
+EX
+
+case class DatabaseConfig(
+    url: String,
+    username: String,
+    password: Secret,
+    allowedSchemas: Set[String],
+    poolConfig: ConnectionPoolConfig = ConnectionPoolConfig()
+)
+
+
+object DatabaseConfig {
+  implicit val config: Config[DatabaseConfig] = {
+       {
+        Config.string("url") zip
+         Config.string("username") zip
+        Config.secret("password") zip
+        Config
+         .setOf("allowed-schemas", Config.string)
+         .withDefault(Set("public")) zip
+        ConnectionPoolConfig.config
+         .withDefault(ConnectionPoolConfig())
+        }.map { case (url, username, password, allowedSchemas,poolConfig) =>
+           DatabaseConfig(url, username, password, allowedSchemas,poolConfig)
+         }
+       }.nested("Database")
+}
+
+case class ConnectionPoolConfig(
+    maxSize: Int = 10,
+    minSize: Int = 1,
+    idleTimeout: Long = 300,
+    maxLifetime: Long = 3600
+)
+
+
+object ConnectionPoolConfig {
+  implicit val config: Config[ConnectionPoolConfig] = {
+    {
+        Config.int("maxSize").withDefault(10) zip
+        Config.int("minSize").withDefault(1) zip
+        Config.long("idleTimeout").withDefault(300L) zip
+        Config.long("maxLifetime").withDefault(3600L)
+    }.map {
+    case (maxSize, minSize, idleTimeout, maxLifetime) =>
+        ConnectionPoolConfig(maxSize, minSize, idleTimeout, maxLifetime)
+    }
+  }.nested("Pool")
+}
+
+
+EX  HOCON
+Database {
+    url = "jdbc:postgresql://localhost:5432/mydb"
+    username = "db_user"
+    password = ${?DATABASE_PASSWORD}
+    allowed-schemas = ["public", "auth", "audit"]
+    Pool {
+        max-size = 10
+        min-size = 1
+        idle-timeout = 400
+        max-lifetime = 7200
+    }
+}
+
+EX Env file
+
+ConfigProvider.fromEnv(pathDelim = "_", seqDelim = ",")
+
+# .env file
+DATABASE_URL=jdbc:postgresql://localhost:5432/mydb
+DATABASE_USERNAME=db_user
+DATABASE_PASSWORD=mypassword
+DATABASE_ALLOWED_SCHEMAS=public, auth, audit
+DATABASE_POOL_MAX_SIZE=10
+DATABASE_POOL_MIN_SIZE=1
+DATABASE_POOL_IDLE_TIMEOUT=400
+DATABASE_POOL_MAX_LIFETIME=7200
