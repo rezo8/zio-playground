@@ -1,0 +1,30 @@
+Chapter 37: Testing: Assertions
+
+Last chapter talked about basics of testing and how to write tests using ZIO Test.
+
+This chapter looks into assertions, the core building blocks of tests.
+
+37.1 Assertions as Predicates
+
+An assertion is a predicate that takes type A and returns a boolean.
+
+def isPositive[A](value: A)(implicit num: Numeric[A]): Boolean = num.gt(value, num.zero)
+
+def isLessThan[A](n: A)(value: A)(implicit ord: Ordering[A]): Boolean = ord.lt(value, n)
+
+def isSome[A](value: Option[A]): Boolean = value.nonEmpty
+
+val sut: Option[Int] = Some(42)
+
+assert(isSome(sut) && isPositive(sut.get) && isLessThan(100)(sut.get))
+
+
+However, this approach has a limitation, as these assertions are not composable.
+
+We need to build it like this:
+
+assert(isSome(isPositive[Int] && isLessThan(100)).test(sut))
+
+where we group the assertions and then provide the shared input at the end.
+
+ZIO allows that with its assertions, and it also composes all the failures to be shared together.

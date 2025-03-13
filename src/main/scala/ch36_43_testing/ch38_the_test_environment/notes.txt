@@ -1,0 +1,241 @@
+Testing: The Test Environment
+
+One advantage from the ZIO Env is that it allows us to provide
+test implementations of these services.
+
+ZIO Test also has test implementation of all standard services in the ZIO
+Environment like Clock, Console, Random, System.
+
+This chapter looks at how we can use these test services to facilitate
+testing our programs
+
+Also how to learn about tools that ZIO provides that modifies funcitonality of test services.
+
+How to access live environment from our own tests
+
+How to create test implementations of our own services.
+
+38.1 Test Implementation of Standard Services
+
+This chapter ultimately just goes into how to use the TestClock, TestRandom, TestSystem
+to simulate behavior.
+
+Not really interested atm so skipping, but this is useful for reference.
+
+38.2 Accessing the Live Environment
+
+Sometimes we may need the "live" environment as opposed to the test environment.
+
+For example, accessing actual environment variable from actual system
+to configure our test resources.
+
+ZIO.Live is a service ZIO Test provides to help with this.
+
+The interface looks like:
+
+
+trait Live {
+  def provide[E, A](zio: ZIO[Any, E, A]): IO[E, A]
+}
+object Live {
+  def live[E, A](zio: ZIO[Any, E, A]): ZIO[Live, E, A] = ???
+  def withLive[R <: Live, E, E1, A, B](zio: ZIO[R, E, A])
+                                      (f: IO[E, A] => ZIO[Any, E1, B]): ZIO[R, E1, B] = ???
+  }
+
+
+Takes an effect that has an environment, and returns a new effect with those dependencies eliminated.
+
+It does this by providing the effect with the live versions of each of the default ZIO Services, which Live has access to internally.
+    This is very powerful and used to fill in Clock, Random, System etc...
+
+For example, this is how we would test an env var from actual system is 42.
+
+for {
+  port <- Live.live(System.env("port"))
+} yield assert(port)(isSome(equalTo("42")))
+
+
+Live.withLive is more complicated and lets us perform an operator on an effect with the live env.
+
+trait MyCustomEnvironment
+lazy val effect: ZIO[MyCustomEnvironment, Nothing, Boolean] = ???
+
+Live.live(effect.timeout(1.second)) does not work
+
+Live.live requires effect has no dependencies other than standard ZIO services since otherwise,
+Live service has no way to provide them.
+
+So withLive we do this.
+
+Live.withLive(effect)(_.timeout(1.second))
+
+Now ZIO Timeout operator will be run with live Clock, but the effect will continue to be run without the default invironments.
+
+So basically a way to more clearly specify which parts of system should use simulated.
+
+
+38.3 Creating Custom Test Implementations.
+
+We need to implement many of our own services and test logic involving these services.
+
+In general, we can think of a service as a collection of functions that take input sand return outputs,
+    possibly maintaining some internal state
+
+To test such as a collection of functions, we would like to be able to:
+
+    1. Return appropriate output sand update the state given a set of inputs
+    2. Access state if it is not already observable.
+    3. Set an appropriate initial state.
+    4. Possibly update the state if it is not already supported by the service.
+
+To see these requirements in action, the chapter implements the Console Service.
+
+trait Console {
+  def printLine(line: String): IO[IOException, Unit]
+  def readLine: IO[IOException, String]
+}
+
+
+object Console {
+  def printLine(line: String): ZIO[Console, IOException, Unit] =
+    ZIO.serviceWithZIO(_.printLine(line))
+
+  val readLine: ZIO[Console, IOException, String] =
+    ZIO.serviceWithZIO(_.readLine)
+}
+
+Because printLine returns Unit, there is no meaningful state.
+    So we have to update internal state.
+
+Since readLine returns string but takes no input, we recognize it must
+    fetch that internal state.
+
+
+Considering, we can represent this state using ZIO's chunk data type.
+
+
+final case class State(input: Chunk[String], output: Chunk[String])
+
+object State {
+  val empty: State = State(Chunk.empty, Chunk.empty)
+}
+
+Now, we can implement the test Console.
+
+
+import java.io.EOFException
+
+final case class TestConsole(ref: Ref[State]) extends Console {
+    def printLine(line: String): IO[IOException, Unit] =
+        ref.update(state => state.copy(state.output = state.output :+ line))
+
+    def readLine: IO[IOException, String] =
+        ref.modify{ state =>
+            if(state.input.isEmpty) {
+                val io = ZIO.fail(new EOFException("no more input")
+                (io, state)
+            }else{
+                val io = ZIO.succeed(state.input.head)
+                (io, state.copy(input = state.input.tail))
+            }
+        }.flatten
+}
+
+A couple of things are missing
+
+1) We have no way of actually constructing a TestConsole value with initial state.
+
+2) We have no way of accessing state now to verify expected results.
+
+3) We have no way of modifying internal state/setting values in buffer.
+
+Solutions for this are as follows:
+
+object TestConsole {
+    val test: ZLayer[Any, Nothing, TestConsole] =
+        ZLayer {
+            for {
+                ref <- Ref.make(State.empty)
+            } yield new TestConsole(ref)
+        }
+}
+
+Now we have fixed 1 and can create the TestConsole for tests.
+
+for 2 and 3, we need to enrich TestConsole class and interface.
+
+final case class TestConsole(ref: Ref[State]) extends Console {
+
+    def feedLine(line: String): UIO[Unit] =
+        ref.update(state => state.copy(input = state.input := line))
+
+    val output: UIO[Chunk[String]] =
+        ref.get.map(_.output)
+
+    def printLine(line: String): IO[IOException, Unit] =
+        ref.update(state => state.copy(state.output = state.output :+ line))
+
+    def readLine: IO[IOException, String] =
+        ref.modify{ state =>
+            if(state.input.isEmpty) {
+                val io = ZIO.fail(new EOFException("no more input")
+                (io, state)
+            }else{
+                val io = ZIO.succeed(state.input.head)
+                (io, state.copy(input = state.input.tail))
+            }
+        }.flatten
+}
+
+Now lets finish the Test Console.
+
+object TestConsole {
+    val test: ZLayer[Any, Nothing, TestConsole] =
+        ZLayer {
+            for {
+                ref <- Ref.make(State.empty)
+            } yield new TestConsole(ref)
+        }
+
+    def feedLine(line: String): ZIO[TestConsole, Nothing, Unit] =
+        ZIO.serviceWithZIO(_.feedLine(line))
+
+    val output: ZIO[TestConsole, Nothing, Chunk[String]] =
+        ZIO.serviceWithZIO(.output)
+}
+
+and use like this
+
+val welcomeToZIO: ZIO[Console, IOException, Unit] =
+  for {
+    _    <- Console.printLine("What's your name?")
+    name <- Console.readLine
+    _ <- Console.printLine("Welcome to ZIO $name!")
+    }
+     yield ()
+
+
+ test("testing console service") {
+    for {
+        _      <- TestConsole.feedLine("Jane Doe")
+        _      <- welcomeToZIO
+        output <- TestConsole.output
+    } yield assert(output)(
+      equalTo(
+        Chunk(
+          "What's your name?",
+          "Welcome to ZIO, Jane Doe!")
+      )
+    )
+ }
+
+
+To me, this approach is too verbose but this is the standared alas.
+
+38.4 Conclusion
+
+Goal of this chapter is to provide material to test effects involving any of the standard
+services in the ZIO environment and our own test implementations.
+
+This will make it easy to test our own services.
