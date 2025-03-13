@@ -1,0 +1,82 @@
+Chapter 36: Testing: Basic Testing
+
+This introduces ZIO Test which is a library trying to solve problems in the testing domain:
+
+How do we leverage ZIO to solve problems in ZIO?
+
+36.1: Tests as Effects
+
+The core idea of ZIO test is to treat every test as an effect.
+
+
+type ZTest[-R, +E] = ZIO[R, TestFailure[E], TestSuccess]
+
+A Test is a ZIO workflow that fails with Test Failure or succeeds with TestSuccess
+
+The TestFailure can have two cases.
+
+TestFailure.Assertion (assertion is incorrect)
+
+TestFailure.Runtime ( error occurred while running)
+
+Conceptualizing a test as an effect has following benefits.
+
+1. Avoids us having to call unsafeRun when tests are running. (i.e. to get ZIO to run)
+
+2. Allows us to unify testing effectful and non-effectful code.
+
+Sometimes we want to write tests involving effects,
+i.e. to verify that the value from a Queue is what we expect.
+
+Othertimes we want to write texts that don't involve effects, i.e. that an addition value is returned
+
+Ideally we want to write these 2 types of tests similarly, so we can seamlessly switch.
+
+3. The third benefit is that making tests effects lets us use all functionality of ZIO to help us solve problems while testing.
+
+ZIO also has BoolAlgebra that allows us to easily require multiple assertions to be true, negate an assertion,
+    or express that one assertion being true means another must be true.
+
+Below is an example of a ZIO test.
+
+
+import zio._
+import zio.test._
+object ZTest {
+  def apply[R, E](
+    assertion: => ZIO[R, E, TestResult]
+): ZIO[R, TestFailure[E], TestSuccess] =
+  ZIO
+    .suspendSucceed(assertion)
+    .foldCauseZIO(
+      cause => ZIO.fail(TestFailure.Runtime(cause)),
+      assert =>
+            if (assert.isFailure)
+                ZIO.fail(TestFailure.Assertion(assert))
+            else
+                ZIO.succeed(TestSuccess.Succeeded())
+      )
+}
+
+we run an assertion, if it fails we fail, and if it succeeds we check that assertion is not a failure.
+
+Simple!
+
+36.2 Specs as Recursively Nested Collections of Tests
+
+in ZIO Test, a ZSpec is a tree-like data structure that can be unit tests or a suite
+consisting of one or more other Specs.
+
+sealed trait ZSpec[-R, +E]
+
+final case class Suite[-R, +E](
+    label: String,
+    specs: ZIO[R with Scope, TestFailure[E], Vector[ZSpec[R, E]]]
+) extends ZSpec[R, E]
+
+final case class Test[-R, +E](
+    label: String,
+    test: ZIO[R, TestFailure[E], TestSuccess]
+)
+
+Thus ZSpec supports arbritrary nesting.
